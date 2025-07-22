@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GPS temps réel - Guidage vocal anticipé</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; font-family: sans-serif; }
+    #map { height: 75vh; }
+    #controls {
+      padding: 10px;
+      background: #f0f0f0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    #address {
+      flex-grow: 1;
+      padding: 6px;
+      font-size: 16px;
+    }
+    select, button {
+      padding: 6px 12px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    #infos {
+      padding: 10px;
+      background: #fafafa;
+      font-weight: bold;
+      font-size: 16px;
+      box-shadow: inset 0 0 5px #ddd;
+      min-height: 40px;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="controls">
+    <input type="text" id="address" placeholder="Entrez une adresse de destination" />
+    <select id="mode">
+      <option value="driving-car">🚗 Voiture</option>
+      <option value="driving-moto">🏍️ Moto</option>
+      <option value="foot-walking">🚶 À pied</option>
+      <option value="cycling-regular">🚴 Vélo</option>
+      <option value="train">🚆 Train</option>
+      <option value="avion">✈️ Avion</option>
+      <option value="bateau">⛴️ Bateau</option>
+    </select>
+    <button id="btn-go">Aller</button>
+    <button id="btn-start">▶️ Démarrer</button>
+    <button id="btn-localisation">📍 Ma position</button>
+  </div>
+
+  <div id="map"></div>
+  <div id="infos">🛈 Choisissez une destination, puis cliquez sur "Démarrer"</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    const ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjM4NjlkYjQxYzhjYTRlYzliYjg0NThhMDczMTgyNzA3IiwiaCI6Im11cm11cjY0In0=";
+
+    let map = L.map('map').setView([0, 0], 2);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let currentPosition = null;
+    let destination = null;
+    let modeChoisi = null;
+    let marker = null;
+    let destinationMarker = null;
+    let routeLine = null;
+    let suiviActif = false;
+    let instructions = [];
+    let instructionsLues = new Set();
+    const DISTANCE_ANNONCE = 80; // mètre avant le virage pour annoncer
+    const DISTANCE_ARRIVEE = 10; // mètres pour considérer arrivé
+
+    const infosDiv = document.getElementById("infos");
+
+    function formatDuree(seconds) {
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes} min`;
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      return `${h}h${m > 0 ? m + ' min' : ''}`;
+    }
+
+    function updateMarker(lat, lon) {
+      if (marker) marker.setLatLng([lat, lon]);
+      else marker = L.marker([lat, lon]).addTo(map).bindPopup("Vous êtes ici").openPopup();
+    }
+
+    function updateDestination(lat, lon) {
+      if (destinationMarker) destinationMarker.setLatLng([lat, lon]);
+      else destinationMarker = L.marker([lat, lon]).addTo(map).bindPopup("Destination").openPopup();
+    }
+
+    function afficherInfos(distanceKm, dureeSec) {
+      infosDiv.textContent = `📍 Distance : ${distanceKm.toFixed(2)} km | Durée estimée : ${formatDuree(dureeSec)}`;
+    }
+
+    function distanceVolOiseau(lat1, lon1, lat2, lon2) {
+      const R = 6371; // km
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function distanceEntrePoints(lat1, lon1, lat2, lon2) {
+      const R = 6371000; // mètres
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function parler(text) {
+      if (!('speechSynthesis' in window)) return;
+      const msg = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(msg);
+    }
+
+    function tracerItineraire(mode) {
+      if (!currentPosition || !destination) return;
+
+      if (mode === "avion" || mode === "bateau") {
+        const distanceKm = distanceVolOiseau(currentPosition[0], currentPosition[1], destination[0], destination[1]);
+        if (distanceKm < 1) { 
+          infosDiv.textContent = "🚆 Trajet impossible.";
+          if (routeLine) map.removeLayer(routeLine);
+          instructions = [];
+          return;
+        }
+        let vitesse = mode === "avion" ? 800 : 40;
+        let dureeHeure = distanceKm / vitesse;
+        let dureeSec = dureeHeure * 3600;
+        if (routeLine) map.removeLayer(routeLine);
+        afficherInfos(distanceKm, dureeSec);
+        parler(`Distance restante ${distanceKm.toFixed(1)} kilomètres. Durée estimée ${formatDuree(dureeSec)}.`);
+        instructions = [];
+        return;
+      }
+
+      if (mode === "train") {
+        infosDiv.textContent = "🚆 Trajet impossible.";
+        if (routeLine) map.removeLayer(routeLine);
+        instructions = [];
+        return;
+      }
+
+      const apiMode = (mode === "driving-moto") ? "driving-car" : mode;
+
+      fetch(`https://api.openrouteservice.org/v2/directions/${apiMode}/geojson`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json, application/geo+json',
+          'Content-Type': 'application/json',
+          'Authorization': ORS_API_KEY
+        },
+        body: JSON.stringify({
+          coordinates: [
+            [currentPosition[1], currentPosition[0]],
+            [destination[1], destination[0]]
+          ],
+          instructions: true
+        })
+      })
+      .then(resp => {
+        if (!resp.ok) throw new Error("No route");
+        return resp.json();
+      })
+      .then(data => {
+        if (!data.features || data.features.length === 0) throw new Error("No route");
+        if (routeLine) map.removeLayer(routeLine);
+        routeLine = L.geoJSON(data, {
+          style: { color: 'blue', weight: 5 }
+        }).addTo(map);
+        map.fitBounds(routeLine.getBounds());
+
+        const summary = data.features[0].properties.summary;
+        afficherInfos(summary.distance / 1000, summary.duration);
+        parler(`Distance restante ${(summary.distance / 1000).toFixed(1)} kilomètres. Durée estimée ${formatDuree(summary.duration)}.`);
+
+        // Récupérer les instructions
+        instructions = [];
+        instructionsLues.clear();
+        const segments = data.features[0].properties.segments || [];
+        if (segments.length > 0) {
+          const steps = segments[0].steps;
+          steps.forEach((s, idx) => {
+            instructions.push({
+              index: idx,
+              distance: s.distance,
+              duration: s.duration,
+              instruction: s.instruction,
+              location: s.way_points[0] !== undefined ? data.features[0].geometry.coordinates[s.way_points[0]] : null
+            });
+          });
+        }
+      })
+      .catch(() => {
+        infosDiv.textContent = "🚆 Trajet impossible.";
+        if (routeLine) map.removeLayer(routeLine);
+        instructions = [];
+      });
+    }
+
+    function geocodeAdresse(adresse) {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(adresse)}`;
+      return fetch(url)
+        .then(resp => resp.json())
+        .then(results => {
+          if (results.length === 0) throw new Error("Adresse non trouvée");
+          return {
+            lat: parseFloat(results[0].lat),
+            lon: parseFloat(results[0].lon)
+          };
+        });
+    }
+
+    function checkInstructions() {
+      if (!currentPosition || instructions.length === 0) return;
+
+      const currentLat = currentPosition[0];
+      const currentLon = currentPosition[1];
+
+      // Annoncer les instructions à l'avance (80m avant)
+      for (const instr of instructions) {
+        if (instructionsLues.has(instr.index)) continue;
+        if (!instr.location) continue;
+        const [lonIns, latIns] = instr.location;
+        const dist = distanceEntrePoints(currentLat, currentLon, latIns, lonIns);
+
+        if (dist < DISTANCE_ANNONCE) {
+          parler(instr.instruction);
+          instructionsLues.add(instr.index);
+          break; // ne lit qu'une instruction à la fois
+        }
+      }
+
+      // Vérifier si arrivé
+      const distArrivee = distanceEntrePoints(currentLat, currentLon, destination[0], destination[1]);
+      if (distArrivee < DISTANCE_ARRIVEE && suiviActif) {
+        parler("Vous êtes arrivé à destination. Bonne journée à vous !");
+        suiviActif = false;
+        document.getElementById("btn-start").textContent = "▶️ Démarrer";
+        infosDiv.textContent = "🎉 Vous êtes arrivé à destination.";
+      }
+    }
+
+    if ("geolocation" in navigator) {
+      navigator.geolocation.watchPosition(pos => {
+        currentPosition = [pos.coords.latitude, pos.coords.longitude];
+        updateMarker(currentPosition[0], currentPosition[1]);
+
+        if (suiviActif) {
+          // Recentrer la carte sur la position actuelle pendant le suivi
+          map.setView(currentPosition, 15);
+
+          tracerItineraire(modeChoisi);
+          checkInstructions();
+        } else {
+          // Sinon, on centre seulement si la position est hors écran
+          if (!map.getBounds().contains(currentPosition)) {
+            map.setView(currentPosition, 15);
+          }
+        }
+      }, err => {
+        alert("Erreur GPS : " + err.message);
+      }, {
+        enableHighAccuracy: true
+      });
+    }
+
+    document.getElementById("btn-go").addEventListener("click", () => {
+      const adresse = document.getElementById("address").value.trim();
+      const mode = document.getElementById("mode").value;
+
+      if (!adresse) return alert("Veuillez entrer une adresse.");
+
+      geocodeAdresse(adresse)
+        .then(coords => {
+          destination = [coords.lat, coords.lon];
+          modeChoisi = mode;
+          updateDestination(coords.lat, coords.lon);
+          tracerItineraire(modeChoisi);
+        })
+        .catch(() => {
+          infosDiv.textContent = "❌ Adresse introuvable.";
+        });
+    });
+
+    document.getElementById("btn-start").addEventListener("click", () => {
+      if (!destination) {
+        alert("Veuillez choisir une destination d'abord.");
+        return;
+      }
+      suiviActif = !suiviActif;
+      document.getElementById("btn-start").textContent = suiviActif ? "⏸️ Pause" : "▶️ Démarrer";
+      if (suiviActif) {
+        tracerItineraire(modeChoisi);
+      }
+    });
+
+    document.getElementById("btn-localisation").addEventListener("click", () => {
+      if (currentPosition) {
+        map.setView(currentPosition, 15);
+      } else {
+        alert("Position inconnue.");
+      }
+    });
+  </script>
+</body>
+</html>
